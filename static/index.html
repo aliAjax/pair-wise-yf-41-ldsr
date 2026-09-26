@@ -19,10 +19,15 @@
   <pre id="result">等待操作</pre>
   <h2>常用接口</h2>
   <pre>GET  /health
-GET  /api/&lt;kind&gt;
+GET  /api/&lt;kind&gt;?status=
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+GET  /api/entities/&lt;id&gt;/versions
+POST /api/entities/&lt;id&gt;/actions
+GET  /api/audit?entity_id=
+
+补修订单 revision_order：分析员建单(POST /api/revision_orders)，
+审核员 return / approve，分析员在原单 resubmit。</pre>
 </main>
 <script>
 async function checkHealth() {

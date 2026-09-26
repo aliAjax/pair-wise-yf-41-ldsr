@@ -54,6 +54,22 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS event_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    version INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_order_id TEXT,
+                    communication_id TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(event_id, revision)
+                );
+                CREATE INDEX IF NOT EXISTS idx_snapshots_event
+                    ON event_snapshots(event_id, revision);
             """)
 
     @staticmethod
@@ -139,6 +155,169 @@ class SQLiteRepository:
         finally:
             connection.close()
         return self.get_entity(entity_id)
+
+    def approve_revision_order(self, order_id, expected_order_version, event_id,
+                               expected_event_version, proposal, communication_id,
+                               reviewer_id):
+        """Atomically apply an approved order and cut a new catalog snapshot.
+
+        Succeeds only when both the order and the target event still match the
+        versions the decision was based on; otherwise a ConflictError is raised
+        and nothing is written.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            order_row = connection.execute(
+                "SELECT version, status, data FROM entities WHERE id = ?",
+                (order_id,),
+            ).fetchone()
+            if not order_row:
+                raise NotFoundError("entity not found: " + order_id)
+            if int(order_row["version"]) != int(expected_order_version):
+                raise ConflictError(
+                    "version conflict: order expected %s, found %s"
+                    % (expected_order_version, order_row["version"])
+                )
+            if order_row["status"] != "pending":
+                raise ConflictError("order is not pending: " + order_row["status"])
+
+            event_row = connection.execute(
+                "SELECT version, status, data FROM entities WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            if not event_row:
+                raise NotFoundError("entity not found: " + event_id)
+            event_version = int(event_row["version"])
+            if event_version != int(expected_event_version):
+                raise ConflictError(
+                    "version conflict: event expected %s, found %s"
+                    % (expected_event_version, event_version)
+                )
+            if event_row["status"] not in ("published", "revised"):
+                raise ConflictError("event is no longer revisable: " + event_row["status"])
+
+            event_data = json.loads(event_row["data"])
+            changes = {
+                "magnitude": [event_data.get("magnitude"), float(proposal["proposed_magnitude"])],
+                "location": [event_data.get("location"), proposal["proposed_location"]],
+                "depth_km": [event_data.get("depth_km"), float(proposal["proposed_depth_km"])],
+            }
+            event_data["magnitude"] = float(proposal["proposed_magnitude"])
+            event_data["location"] = proposal["proposed_location"]
+            event_data["depth_km"] = float(proposal["proposed_depth_km"])
+            event_data["revision_order_id"] = order_id
+            event_data["communication_id"] = communication_id
+            next_event_version = event_version + 1
+            connection.execute(
+                "UPDATE entities SET status = 'revised', version = ?, data = ?, "
+                "updated_at = ? WHERE id = ? AND version = ?",
+                (
+                    next_event_version,
+                    json.dumps(event_data, ensure_ascii=False, sort_keys=True),
+                    now,
+                    event_id,
+                    event_version,
+                ),
+            )
+
+            revision = connection.execute(
+                "SELECT COALESCE(MAX(revision), 0) + 1 AS next_revision "
+                "FROM event_snapshots WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()["next_revision"]
+            connection.execute(
+                "INSERT INTO event_snapshots(event_id, revision, version, status, data, "
+                "source, source_order_id, communication_id, created_by, created_at) "
+                "VALUES (?, ?, ?, 'revised', ?, 'revision_order', ?, ?, ?, ?)",
+                (
+                    event_id,
+                    revision,
+                    next_event_version,
+                    json.dumps(event_data, ensure_ascii=False, sort_keys=True),
+                    order_id,
+                    communication_id,
+                    reviewer_id,
+                    now,
+                ),
+            )
+
+            order_data = json.loads(order_row["data"])
+            order_data["applied_revision"] = revision
+            order_data["communication_id"] = communication_id
+            order_data["applied_at"] = now
+            next_order_version = int(order_row["version"]) + 1
+            connection.execute(
+                "UPDATE entities SET status = 'approved', version = ?, data = ?, "
+                "updated_at = ? WHERE id = ? AND version = ?",
+                (
+                    next_order_version,
+                    json.dumps(order_data, ensure_ascii=False, sort_keys=True),
+                    now,
+                    order_id,
+                    order_row["version"],
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+        order = self.get_entity(order_id)
+        event = self.get_entity(event_id)
+        return order, event, revision, changes
+
+    def save_event_snapshot(self, entity, source, created_by, communication_id=None):
+        """Snapshot an event entity at its current version (e.g. on publish)."""
+        now = utcnow()
+        with self._connect() as connection:
+            revision = connection.execute(
+                "SELECT COALESCE(MAX(revision), 0) + 1 AS next_revision "
+                "FROM event_snapshots WHERE event_id = ?",
+                (entity["id"],),
+            ).fetchone()["next_revision"]
+            connection.execute(
+                "INSERT INTO event_snapshots(event_id, revision, version, status, data, "
+                "source, source_order_id, communication_id, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                (
+                    entity["id"],
+                    revision,
+                    entity["version"],
+                    entity["status"],
+                    json.dumps(entity["data"], ensure_ascii=False, sort_keys=True),
+                    source,
+                    communication_id,
+                    created_by,
+                    now,
+                ),
+            )
+        return revision
+
+    def list_event_snapshots(self, event_id):
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM event_snapshots WHERE event_id = ? ORDER BY revision",
+                (event_id,),
+            ).fetchall()
+        return [
+            {
+                "event_id": row["event_id"],
+                "revision": int(row["revision"]),
+                "version": int(row["version"]),
+                "status": row["status"],
+                "data": json.loads(row["data"]),
+                "source": row["source"],
+                "source_order_id": row["source_order_id"],
+                "communication_id": row["communication_id"],
+                "created_by": row["created_by"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:

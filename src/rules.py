@@ -1,16 +1,20 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import (
     ConflictError,
     InvalidTransition,
+    NotFoundError,
     PermissionDenied,
     ValidationError,
 )
+
+REVISABLE_EVENT_STATUSES = ("published", "revised")
 
 
 def _validate_station(actor, data, lookup):
     if not data.get("code"):
         raise ValidationError("station code is required")
+    return dict(data)
 
 
 def _validate_event(actor, data, lookup):
@@ -19,6 +23,7 @@ def _validate_event(actor, data, lookup):
         raise ValidationError("event requires at least two station reports")
     if not data.get("title"):
         raise ValidationError("event title is required")
+    return dict(data)
 
 
 def _validate_associate(actor, entity, data, lookup):
@@ -53,14 +58,136 @@ CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event}
 CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate}
 
 
+def _find_event(lookup, event_id):
+    rows = lookup('event', 'id', event_id) if lookup else []
+    return rows[0] if rows else None
+
+
+def _as_number(value, field, low=None, high=None):
+    if isinstance(value, bool):
+        raise ValidationError("%s must be a number" % field)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValidationError("%s must be a number" % field)
+    if low is not None and number < low:
+        raise ValidationError("%s must be >= %s" % (field, low))
+    if high is not None and number > high:
+        raise ValidationError("%s must be <= %s" % (field, high))
+    return number
+
+
+def _validate_proposal(data):
+    for field in ("basis", "proposed_magnitude", "proposed_location", "proposed_depth_km"):
+        if not data.get(field) and data.get(field) != 0:
+            raise ValidationError("missing required field: " + field)
+    _as_number(data["proposed_magnitude"], "proposed_magnitude", low=0, high=10)
+    _as_number(data["proposed_depth_km"], "proposed_depth_km", low=0, high=800)
+
+
+def _validate_revision_order_create(actor, data, lookup):
+    event_id = data.get("event_id")
+    if not event_id:
+        raise ValidationError("missing required field: event_id")
+    event = _find_event(lookup, event_id)
+    if not event:
+        raise NotFoundError("event not found: " + str(event_id))
+    if event["status"] not in REVISABLE_EVENT_STATUSES:
+        raise InvalidTransition(
+            "revision orders can only target published or revised events; event is %s"
+            % event["status"]
+        )
+    _validate_proposal(data)
+    payload = dict(data)
+    payload["event_version"] = event["version"]
+    payload["resubmit_count"] = 0
+    payload["comments"] = []
+    return payload
+
+
+def _validate_revision_order_return(actor, entity, data, lookup):
+    if not data.get("comment"):
+        raise ValidationError("missing required field: comment")
+    stamped = {
+        "comment": data["comment"],
+        "by": actor.user_id,
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    comments = list(entity["data"].get("comments") or []) + [stamped]
+    return {"comments": comments}
+
+
+def _validate_revision_order_resubmit(actor, entity, data, lookup):
+    _validate_proposal(data)
+    event = _find_event(lookup, entity["data"]["event_id"])
+    if not event:
+        raise NotFoundError("event not found: " + entity["data"]["event_id"])
+    if event["status"] not in REVISABLE_EVENT_STATUSES:
+        raise InvalidTransition(
+            "event is no longer revisable (status: %s)" % event["status"]
+        )
+    patch = dict(data)
+    patch["resubmit_count"] = int(entity["data"].get("resubmit_count") or 0) + 1
+    patch["event_version"] = event["version"]
+    return patch
+
+
+def _validate_revision_order_approve(actor, entity, data, lookup):
+    event = _find_event(lookup, entity["data"]["event_id"])
+    if not event:
+        raise NotFoundError("event not found: " + entity["data"]["event_id"])
+    if event["status"] not in REVISABLE_EVENT_STATUSES:
+        raise InvalidTransition(
+            "event is no longer revisable (status: %s)" % event["status"]
+        )
+    if event["version"] != int(entity["data"]["event_version"]):
+        raise ConflictError(
+            "revision order is stale: event version %s, order based on %s"
+            % (event["version"], entity["data"]["event_version"])
+        )
+    return {}
+
+
+CUSTOM_CREATE['revision_order'] = _validate_revision_order_create
+CUSTOM_TRANSITIONS[('revision_order', 'return')] = _validate_revision_order_return
+CUSTOM_TRANSITIONS[('revision_order', 'resubmit')] = _validate_revision_order_resubmit
+CUSTOM_TRANSITIONS[('revision_order', 'approve')] = _validate_revision_order_approve
+
+
 class RuleEngine:
-    ALIASES = {'stations': 'station', 'events': 'event'}
-    INITIAL_STATUS = {'station': 'online', 'event': 'candidate'}
-    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawn')}}
-    CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports')}
-    ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'withdraw'): ('reason',)}
-    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer')}
+    ALIASES = {'stations': 'station', 'events': 'event', 'revision_orders': 'revision_order'}
+    INITIAL_STATUS = {'station': 'online', 'event': 'candidate', 'revision_order': 'pending'}
+    TRANSITIONS = {
+        'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')},
+        'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed', 'revised'), 'published'), 'withdraw': (('published', 'revised'), 'withdrawn')},
+        'revision_order': {'return': (('pending',), 'returned'), 'resubmit': (('returned',), 'pending'), 'approve': (('pending',), 'approved')},
+    }
+    CREATE_REQUIRED = {
+        'station': ('code', 'lat', 'lon'),
+        'event': ('title', 'origin_time', 'location', 'reports'),
+        'revision_order': ('event_id', 'basis', 'proposed_magnitude', 'proposed_location', 'proposed_depth_km'),
+    }
+    ACTION_REQUIRED = {
+        ('station', 'offline'): ('reason',),
+        ('event', 'review'): ('reviewer', 'magnitude'),
+        ('event', 'publish'): ('communication_id',),
+        ('event', 'withdraw'): ('reason',),
+        ('revision_order', 'return'): ('comment',),
+        ('revision_order', 'resubmit'): ('basis', 'proposed_magnitude', 'proposed_location', 'proposed_depth_km'),
+        ('revision_order', 'approve'): ('communication_id',),
+    }
+    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst'), 'revision_order': ('admin', 'analyst')}
+    ROLE_ACTIONS = {
+        'offline': ('admin', 'station'),
+        'online': ('admin', 'station'),
+        'associate': ('admin', 'analyst'),
+        'review': ('admin', 'reviewer'),
+        'publish': ('admin', 'reviewer'),
+        'withdraw': ('admin', 'reviewer'),
+        'return': ('admin', 'reviewer'),
+        'resubmit': ('admin', 'analyst'),
+        'approve': ('admin', 'reviewer'),
+    }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -91,7 +218,7 @@ class RuleEngine:
         self._require(data, self.CREATE_REQUIRED.get(kind, ()))
         custom = CUSTOM_CREATE.get(kind)
         if custom:
-            custom(actor, data, lookup)
+            data = custom(actor, data, lookup)
         return dict(data)
 
     def validate_transition(self, actor, entity, action, data, lookup=None):
