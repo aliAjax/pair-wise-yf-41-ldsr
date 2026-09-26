@@ -8,6 +8,13 @@ from .domain import (
 )
 
 
+def _find_one(lookup, kind, field, value):
+    if lookup is None:
+        return None
+    rows = lookup(kind, field, value) or []
+    return rows[0] if rows else None
+
+
 def _validate_station(actor, data, lookup):
     if not data.get("code"):
         raise ValidationError("station code is required")
@@ -26,6 +33,55 @@ def _validate_associate(actor, entity, data, lookup):
     if len(reports) < 2:
         raise ValidationError("two reports are required for association")
     return {"associated_count": len(reports)}
+
+
+def _ensure_number(value, field):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValidationError(field + " must be a number")
+
+
+def _published_event_or_error(lookup, event_id):
+    event = _find_one(lookup, "event", "id", event_id)
+    if event is None:
+        raise ValidationError("target event not found: " + str(event_id))
+    if event["status"] not in ("published", "revised"):
+        raise ValidationError("revision order requires a published or revised event")
+    return event
+
+
+def _validate_revision_order(actor, data, lookup):
+    event = _published_event_or_error(lookup, data.get("event_id"))
+    _ensure_number(data.get("magnitude"), "magnitude")
+    _ensure_number(data.get("depth"), "depth")
+    data["event_version"] = event["version"]
+    data["resubmit_count"] = 0
+
+
+def _validate_order_resubmit(actor, entity, data, lookup):
+    event = _published_event_or_error(lookup, entity["data"].get("event_id"))
+    _ensure_number(data.get("magnitude"), "magnitude")
+    _ensure_number(data.get("depth"), "depth")
+    return {
+        "event_version": event["version"],
+        "resubmit_count": int(entity["data"].get("resubmit_count", 0)) + 1,
+    }
+
+
+def _validate_order_approve(actor, entity, data, lookup):
+    event = _find_one(lookup, "event", "id", entity["data"].get("event_id"))
+    if event is None:
+        raise ValidationError(
+            "target event not found: " + str(entity["data"].get("event_id"))
+        )
+    if event["status"] not in ("published", "revised"):
+        raise InvalidTransition("target event is no longer published")
+    base_version = entity["data"].get("event_version")
+    if base_version is None or int(base_version) != int(event["version"]):
+        raise ConflictError(
+            "event version expired: order bases on %s, current is %s"
+            % (base_version, event["version"])
+        )
+    return {}
 
 
 def associate_reports(reports, max_delta=120, max_distance=3.0):
@@ -49,18 +105,18 @@ def magnitude_median(amplitudes):
     return (values[middle - 1] + values[middle]) / 2.0
 
 
-CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event}
-CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate}
+CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event, 'revision_order': _validate_revision_order}
+CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate, ('revision_order', 'resubmit'): _validate_order_resubmit, ('revision_order', 'approve'): _validate_order_approve}
 
 
 class RuleEngine:
-    ALIASES = {'stations': 'station', 'events': 'event'}
-    INITIAL_STATUS = {'station': 'online', 'event': 'candidate'}
-    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawn')}}
-    CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports')}
-    ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'withdraw'): ('reason',)}
-    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer')}
+    ALIASES = {'stations': 'station', 'events': 'event', 'revision_orders': 'revision_order'}
+    INITIAL_STATUS = {'station': 'online', 'event': 'candidate', 'revision_order': 'submitted'}
+    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'withdraw': (('published', 'revised'), 'withdrawn')}, 'revision_order': {'reject': (('submitted',), 'rejected'), 'resubmit': (('rejected',), 'submitted'), 'approve': (('submitted',), 'approved')}}
+    CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports'), 'revision_order': ('event_id', 'basis', 'magnitude', 'location', 'depth')}
+    ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'withdraw'): ('reason',), ('revision_order', 'reject'): ('opinion',), ('revision_order', 'resubmit'): ('basis', 'magnitude', 'location', 'depth')}
+    CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst'), 'revision_order': ('admin', 'analyst')}
+    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer'), 'reject': ('admin', 'reviewer'), 'resubmit': ('admin', 'analyst'), 'approve': ('admin', 'reviewer')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -115,13 +171,6 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
-
-
-def _find_one(lookup, kind, field, value):
-    if lookup is None:
-        return None
-    rows = lookup(kind, field, value) or []
-    return rows[0] if rows else None
 
 
 def _date_ordinal(value):
